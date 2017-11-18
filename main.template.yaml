@@ -576,7 +576,7 @@ Resources:
                       padding: 5px;
                       text-transform: uppercase;
                   }
-                  .access-denied, .access-granted, #template, #download-anchor {
+                  .access-denied, .access-granted, #template, #download-anchor, #toast {
                     display: none;
                   }
                   .bold {
@@ -596,6 +596,17 @@ Resources:
                     margin: 27px auto 0;
                     display: block;
                     font-size: 14px;
+                  }
+                  #toast {
+                      position: absolute;
+                      bottom: 0;
+                      margin: 0 auto;
+                      text-align: center;
+                      width: 100%;
+                      background: #38e6a2;
+                      color: white;
+                      padding: 10px;
+                      font-size: 20px;
                   }
                   :focus {outline:none;}
                   ::-moz-focus-inner {border:0;}
@@ -661,12 +672,14 @@ Resources:
                   </article>
                 </section>
                 <a class="accent about" href="https://github.com/sd65/VPN-on-the-Go">Help & info</a>
+                <p id="toast"></p>
                 <a id='download-anchor'></a>
                 <script>
                   password = ''
                   const showElements = (s) => Array.from(document.querySelectorAll(s)).forEach(e => e.style.display = 'block')
                   const getSelectValue = (e) => e.options[e.selectedIndex].value
                   const submitpassword = (e) => {
+                    showToast('Logging in...')
                     e.preventDefault()
                     password = document.getElementById("password").value
                     document.getElementById("passwordsection").style.display = 'none'
@@ -674,6 +687,7 @@ Resources:
                   }
                   const submit = (e) => {
                     e.preventDefault()
+                    showToast('Submiting...')
                     var expValue =  parseInt(document.getElementById("exp-value").value)
                     var expUnit =  parseInt(getSelectValue(document.getElementById("exp-unit")))
                     var payload = {
@@ -689,12 +703,28 @@ Resources:
                           'x-api-key': password
                         }
                     })
-                    .then(function(res){ return res.text() })
-                    .then(function(id){ alert("New VPN " + id + " created."); refresh() })
+                    .then((res) => {
+                      hideToast()
+                      if(res.ok) {
+                        return res.text()
+                      } else {
+                        throw new Error('Error while submiting')
+                      }
+                    })
+                    .then((id) => { 
+                      showToast("New VPN " + id + " created."); 
+                      setTimeout(() => {
+                        refresh() 
+                      }, 3000)
+                      
+                    })
+                    .catch(alert)
                   }
                   const refresh = () => {
+                    showToast('Refreshing...')
                     fetch('./api/server/', { headers: { 'x-api-key': password } })
                     .then((res) => {
+                      hideToast()
                       if(res.ok) {
                         return res.json()
                       } else {
@@ -704,7 +734,7 @@ Resources:
                     .then((r) => {
                       showElements(".access-granted")
                       Array.from(document.querySelectorAll("#existing > *:nth-child(n+5)")).forEach(e => e.parentNode.removeChild(e))
-                      var template = '<p>No content</p>'
+                      var template = '<p style="text-align: center">No content</p>'
                       if (Object.keys(r).length !== 0) {
                         template = document.getElementById("template").outerHTML.replace("id=", 'data-id=')
                         for (id in r) {
@@ -741,10 +771,12 @@ Resources:
                           anchor.click()
                           URL.revokeObjectURL(url);
                       });  
-                    } else if(initElem.className.includes('delete')) { 
+                    } else if(initElem.className.includes('delete')) {
+                      showToast('Deleting...')
                       var id = initElem.getAttribute("data-id")
                       fetch('./api/server/?id=' + id, { headers: { 'x-api-key': password }, method: 'DELETE' })
                       .then((res) => {
+                        hideToast()
                         if(res.ok) {
                           return
                         } else {
@@ -759,10 +791,18 @@ Resources:
                       })
                     }
                   }
+                  const showToast = (msg) => {
+                    var t = document.getElementById("toast")
+                    t.style.display = 'block'
+                    t.innerText = msg
+                  }
+                  const hideToast = () => {
+                    document.getElementById("toast").style.display = 'none'
+                  }
                   document.getElementById("form").addEventListener("submit", submit)
-                  document.getElementById("formpassword").addEventListener("submit", submitpassword)
                   document.getElementById("refresh").addEventListener("click", refresh)
                   document.getElementById('existing').addEventListener('click', clickHandler)
+                  document.getElementById("formpassword").addEventListener("submit", submitpassword)
                 </script>
               </body>
               </html>
