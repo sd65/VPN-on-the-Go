@@ -582,7 +582,7 @@ Resources:
                   .bold {
                     font-weight: bold;
                   }
-                  input[type="submit"]:hover { 
+                  input[type="submit"]:hover, .download {
                     cursor: pointer; 
                   }
                   .shortId {
