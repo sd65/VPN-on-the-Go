@@ -1,0 +1,945 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: VPN on the Go
+
+Parameters:
+  pStageName:
+    Type: String
+    Description: Name of the stage, used to build the invoke URL
+    Default: vpnonthego
+  pVpnPassword:
+    Type: String
+    Description: Password for auth
+    Default: vpnpasswordvpnpasswordvpnpassword
+    MinLength: 20
+  pVpnOnTheGoInstallScriptName:
+    Type: String
+    Description: Name
+    Default: install_openvpn.sh
+
+Resources:
+
+  VpnOnTheGoCleanVpnLambdaRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: events.amazonaws.com
+          Action: sts:AssumeRole
+
+  VpnOnTheGoInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+          Action: sts:AssumeRole
+
+  VpnOnTheGoInstanceRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: root
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:GetObject
+          - s3:PutObject
+          - s3:DeleteObject
+          Resource: arn:aws:s3:::*
+      Roles: 
+      - !Ref VpnOnTheGoInstanceRole
+
+  VpnOnTheGoDownloadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: apigateway.amazonaws.com
+          Action: sts:AssumeRole
+
+  VpnOnTheGoDownloadRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: root
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:GetObject
+          Resource: arn:aws:s3:::*
+      Roles: 
+      - !Ref VpnOnTheGoDownloadRole
+
+  VpnOnTheGoInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref VpnOnTheGoInstanceRole
+
+  VpnOnTheGoBucket:
+    Type: AWS::S3::Bucket
+
+  VpnOnTheGoOpenVpnInstallScriptUploadCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt VpnOnTheGoOpenVpnInstallScriptLambda.Arn
+
+  VpnOnTheGoOpenVpnInstallScriptLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: This lambda called as a Cloudfomation Custom Resource upload a OpenVPN install script to a bucket
+      Handler: index.handler
+      Role: !GetAtt VpnOnTheGoLambdasRole.Arn
+      Runtime: python3.6
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+            print(event)
+            if event['RequestType'] == 'Delete':
+              boto3.client("s3").delete_object(Bucket='${VpnOnTheGoBucket}', Key='${pVpnOnTheGoInstallScriptName}')
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return 0
+            code = """#!/bin/bash
+
+              newclient () {
+                d="/root"
+                n="client-$(cat /proc/sys/kernel/random/uuid)"
+                cd /etc/openvpn/easy-rsa/
+                ./easyrsa build-client-full $n nopass
+                cp /etc/openvpn/client-template.txt $d/$n.ovpn
+                cat << EOF >> $d/$n.ovpn
+          <ca>
+          $(cat /etc/openvpn/easy-rsa/pki/ca.crt)
+          </ca>
+          <cert>
+          $(cat /etc/openvpn/easy-rsa/pki/issued/$n.crt)
+          </cert>
+          <key>
+          $(cat /etc/openvpn/easy-rsa/pki/private/$n.key)
+          </key>
+          key-direction 1
+          <tls-auth>
+          $(cat /etc/openvpn/tls-auth.key)
+          </tls-auth>
+          EOF
+              }
+
+              [[ "$1" == newclient ]] && newclient && exit
+
+              PORT=1194
+              CIPHER="cipher AES-128-CBC"
+              DH_KEY_SIZE="2048"
+              RSA_KEY_SIZE="2048"
+
+              yum install -y epel-release
+              yum install -y openvpn iptables openssl wget ca-certificates curl
+              wget -O ~/EasyRSA-3.0.3.tgz https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.3/EasyRSA-3.0.3.tgz
+              tar xzf ~/EasyRSA-3.0.3.tgz -C ~/
+              mv ~/EasyRSA-3.0.3/ /etc/openvpn/easy-rsa/
+              chown -R root:root /etc/openvpn/easy-rsa/
+              rm -rf ~/EasyRSA-3.0.3.tgz
+              cd /etc/openvpn/easy-rsa/
+              echo "set_var EASYRSA_KEY_SIZE $RSA_KEY_SIZE" > vars
+              rngd -r /dev/urandom -o /dev/random
+              ./easyrsa init-pki
+              ./easyrsa --batch build-ca nopass
+              openssl dhparam -out dh.pem $DH_KEY_SIZE
+              ./easyrsa build-server-full server nopass
+              EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl
+              openvpn --genkey --secret /etc/openvpn/tls-auth.key
+              cp pki/ca.crt pki/private/ca.key dh.pem pki/issued/server.crt pki/private/server.key /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn
+              chmod 644 /etc/openvpn/crl.pem
+              echo "local $(curl http://169.254.169.254/latest/meta-data/local-ipv4)
+              port $PORT
+              proto udp
+              dev tun
+              user nobody
+              group nobody
+              persist-key
+              persist-tun
+              keepalive 10 120
+              topology subnet
+              server 10.8.0.0 255.255.255.0
+              ifconfig-pool-persist ipp.txt
+              push 'dhcp-option DNS 208.67.222.222'
+              push 'dhcp-option DNS 208.67.220.220'
+              push 'redirect-gateway def1 bypass-dhcp'
+              crl-verify crl.pem
+              ca ca.crt
+              cert server.crt
+              key server.key
+              tls-auth tls-auth.key 0
+              dh dh.pem
+              auth SHA256
+              $CIPHER
+              tls-server
+              tls-version-min 1.2
+              tls-cipher TLS-DHE-RSA-WITH-AES-128-GCM-SHA256
+              status openvpn.log
+              verb 3" > /etc/openvpn/server.conf
+              echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+              echo 1 > /proc/sys/net/ipv4/ip_forward
+              $(echo "iptables -t nat -A POSTROUTING -o eth0 -s 10.8.0.0/24 -j MASQUERADE" | tee /etc/rc.d/rc.local)
+              chmod +x /etc/rc.d/rc.local
+              service openvpn restart
+              chkconfig openvpn on
+              IP=$(curl http://169.254.169.254/latest/meta-data/public-ipv4)
+              echo "client
+              proto udp
+              remote $IP $PORT
+              dev tun
+              resolv-retry infinite
+              nobind
+              persist-key
+              persist-tun
+              remote-cert-tls server
+              auth SHA256
+              $CIPHER
+              tls-client
+              tls-version-min 1.2
+              tls-cipher TLS-DHE-RSA-WITH-AES-128-GCM-SHA256
+              setenv opt block-outside-dns
+              verb 3" > /etc/openvpn/client-template.txt
+              newclient
+            """
+            boto3.client("s3").put_object(Bucket='${VpnOnTheGoBucket}', Key='${pVpnOnTheGoInstallScriptName}', Body=code)
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  VpnOnTheGoOpenVpnInstallScriptLambdaLogGroup:
+   Type: AWS::Logs::LogGroup
+   Properties:
+      LogGroupName: !Sub "/aws/lambda/${VpnOnTheGoOpenVpnInstallScriptLambda}"
+      RetentionInDays: 1
+
+  VpnOnTheGoLambdasRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AWSLambdaFullAccess
+      - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+      - arn:aws:iam::aws:policy/AmazonAPIGatewayAdministrator
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetRole
+
+  VpnOnTheGoCleanVpnLambdaPermission1:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VpnOnTheGoCleanVpnLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com  
+
+  VpnOnTheGoCleanVpnLambdaPermission2:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VpnOnTheGoCleanVpnLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  VpnOnTheGoNewVpnLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: This lambda creates a new OpenVPN instance
+      Handler: index.handler
+      Role: !GetAtt VpnOnTheGoLambdasRole.Arn
+      Runtime: python3.6
+      Timeout: 60
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import base64
+          import uuid
+          import time
+
+          def die(msg): return { 'statusCode': 400, 'body': msg }
+
+          def handler(event, context):
+            # Checks
+            if not event['body']:
+              return die('No body')
+            try:
+              body = json.loads(event['body'])
+            except Exception:
+              return die('Not a json body')
+            if not 'region' in body:
+              return die('No region in body')
+            region = body['region']
+            if not 'expire_in' in body:
+              expire_in = 0
+            else:
+              expire_in = body['expire_in']
+            # Do
+            expire_tt = 0 if expire_in == 0 else int(time.time()) + ( expire_in * 60)
+            id = "{}_{}_{}".format(uuid.uuid4(), region, expire_tt)
+            bucket = '${VpnOnTheGoBucket}'
+            boto3.client("s3").put_object(Bucket=bucket, Key=id + '/in_progress')
+            boto3.client("s3").put_object(Bucket=bucket, Key=id + '/first_run_cleaner_ignore')
+            # SG
+            client = boto3.client('ec2', region_name=region)
+            sg_group_id = client.create_security_group(Description='VPNONTHEGO', GroupName=id)['GroupId']
+            client.authorize_security_group_ingress(GroupId=sg_group_id, IpProtocol='udp', FromPort=1194, ToPort=1194, CidrIp='0.0.0.0/0')
+            # Find latest image
+            response = client.describe_images(
+                Filters=[
+                    { 'Name': 'owner-alias', 'Values': [ 'amazon' ] },                 
+                    { 'Name': 'virtualization-type', 'Values': [ 'paravirtual' ] },                      
+                    { 'Name': 'description', 'Values': [ 'Amazon Linux AMI * x86_64 PV EBS' ] }
+                ]
+            )
+            latest_image = sorted(response['Images'], key=lambda k: k['CreationDate'], reverse=True)[0]['ImageId']
+            # Request Spot instances
+            request = client.request_spot_instances(
+              SpotPrice='0.02',
+              LaunchSpecification={
+                  'SecurityGroups': [ id ],
+                  'IamInstanceProfile': { 'Arn': '${VpnOnTheGoInstanceProfile.Arn}' },
+                  'ImageId': latest_image,
+                  'InstanceType': 't1.micro',
+                  'UserData': base64.b64encode("""#!/bin/bash 
+                    set -ex
+                    yum update -y
+                    aws s3 cp s3://{bucket}/${pVpnOnTheGoInstallScriptName} .
+                    bash ${pVpnOnTheGoInstallScriptName}
+                    aws s3 cp /root/client* s3://{bucket}/{id}/
+                    rm /root/client*
+                    aws s3 rm s3://{bucket}/{id}/in_progress
+                  """.format(bucket=bucket, id=id).encode('utf-8')).decode('utf-8')
+              },
+            )['SpotInstanceRequests'][0]['SpotInstanceRequestId']
+            client.create_tags(Resources=[ request ], Tags=[ { 'Key': 'id', 'Value': id } ])
+            #client.get_waiter('spot_instance_request_fulfilled').wait(
+            #  SpotInstanceRequestIds=[ request ],
+            #  WaiterConfig={ 'Delay': 5, 'MaxAttempts': 10 }
+            #)
+            # Plan deletion
+            if expire_in > 0:
+              cloudwatch_events = boto3.client('events')
+              cloudwatch_events.put_rule(
+                  Name=id,
+                  RoleArn='${VpnOnTheGoCleanVpnLambdaRuleRole.Arn}',
+                  ScheduleExpression='rate({} minutes)'.format(expire_in), #TODO hours
+                  State='ENABLED'
+              )
+              cloudwatch_events.put_targets(
+                  Rule=id,
+                  Targets=[ {  'Arn': '${VpnOnTheGoCleanVpnLambda.Arn}', 'Id': id, 'Input': json.dumps({'id': id}) } ]
+              )
+            return {
+              'statusCode': 200,
+              'body': id
+            }
+
+  VpnOnTheGoNewVpnLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt VpnOnTheGoNewVpnLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VpnOnTheGoApi}/*"
+
+  VpnOnTheGoNewVpnLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${VpnOnTheGoNewVpnLambda}"
+      RetentionInDays: 7
+
+  VpnOnTheGoGetVpnLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: This lambda return the state of all OpenVpn instances
+      Handler: index.handler
+      Role: !GetAtt VpnOnTheGoLambdasRole.Arn
+      Runtime: python3.6
+      Timeout: 60
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import time
+          from datetime import timedelta
+
+          def handler(event, context):
+            client_s3 = boto3.client('s3')
+            bucket = client_s3.list_objects(Bucket='${VpnOnTheGoBucket}')
+            res = {}
+            if 'Contents' in bucket:
+              for f in bucket['Contents']:
+                if f['Key'] == '${pVpnOnTheGoInstallScriptName}':
+                  continue
+                key, file = f['Key'].split('/')
+                if not key in res or not isinstance(res[key], dict):
+                  _, region, expire_tt = key.split('_')
+                  if expire_tt == 0:
+                    expire = "never"
+                  else:
+                    now = int(time.time())
+                    expire_tt = int(expire_tt)
+                    expire = str(timedelta(seconds=(expire_tt - now)))
+                  res[key] = { 'region': region, 'expire_tt': expire_tt, 'expire': expire}
+                if file == 'in_progress':
+                  res[key]['in_progress'] = True
+                elif file == 'first_run_cleaner_ignore':
+                  continue
+                else:
+                  if not 'files' in res[key]:
+                    res[key]['files'] = []
+                  res[key]['files'].append(file)
+            return { 'statusCode': 200, 'body': json.dumps(res) }
+
+  VpnOnTheGoGetVpnLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt VpnOnTheGoGetVpnLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VpnOnTheGoApi}/*"
+
+  VpnOnTheGoGetVpnLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${VpnOnTheGoGetVpnLambda}"
+      RetentionInDays: 7
+
+  VpnOnTheGoCleanVpnLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Remove an OpenVpn instance
+      Handler: index.handler
+      Role: !GetAtt VpnOnTheGoLambdasRole.Arn
+      Runtime: python3.6
+      Timeout: 15
+      Code:
+        ZipFile: !Sub |
+          import boto3
+
+          def handler(event, context):
+            print(event)
+            if 'queryStringParameters' in event:
+              qs = event['queryStringParameters']
+              if not isinstance(qs, dict) or not 'id' in qs:
+                return { 'statusCode': 401 }
+              id = qs['id']
+              http = True
+            else:
+              id = event['id']
+              http = False
+            region = id.split('_')[1]
+            client_s3 = boto3.client('s3')
+            bucket = client_s3.list_objects(Bucket='${VpnOnTheGoBucket}', Prefix=id)
+            if not 'Contents' in bucket:
+              print('No content, so ignored')
+              return 0
+            for file in bucket['Contents']:
+              k = id + '/first_run_cleaner_ignore'
+              if file['Key'] == k:
+                client_s3.delete_object(Bucket='${VpnOnTheGoBucket}', Key=k)
+                print('First run ignored')
+                return 0
+            for file in bucket['Contents']:
+              client_s3.delete_object(Bucket='${VpnOnTheGoBucket}', Key=file['Key'])
+            client_ec2 = boto3.client('ec2', region_name=region)
+            r = client_ec2.describe_spot_instance_requests(Filters=[ { 'Name': 'tag:id', 'Values': [ id ] }])['SpotInstanceRequests'][0]
+            sir_id = r['SpotInstanceRequestId']
+            instance_id = r['InstanceId']
+            client_ec2.terminate_instances(InstanceIds=[ instance_id ])
+            client_ec2.cancel_spot_instance_requests(SpotInstanceRequestIds=[ sir_id ])
+            #client_ec2.delete_security_group(GroupName=id)
+            client_events = boto3.client('events')
+            client_events.remove_targets(Rule=id, Ids=[ id ])
+            client_events.delete_rule(Name=id)
+            print('All deleted')
+            if http:
+              return { 'statusCode': 200 }
+
+  VpnOnTheGoCleanVpnLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${VpnOnTheGoCleanVpnLambda}"
+      RetentionInDays: 1
+
+  VpnOnTheGoNewVpnLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt VpnOnTheGoNewVpnLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${VpnOnTheGoApi}/*"
+
+  VpnOnTheGoApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: VPN on the GO
+      FailOnWarnings: true
+
+  VpnOnTheGoApiGetHtmlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref VpnOnTheGoApi
+      ResourceId: !GetAtt VpnOnTheGoApi.RootResourceId
+      HttpMethod: GET
+      MethodResponses:
+      - StatusCode: 200
+        ResponseParameters:
+            method.response.header.Content-Type: true
+      Integration:
+        Type: MOCK
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Content-Type: "'text/html'"
+          ResponseTemplates:
+            text/html: |
+              <!DOCTYPE html>
+              <html lang="en">
+              <head>
+                <meta charset="utf-8" />
+                <title>VPN on the Go</title>
+                <link href="https://fonts.googleapis.com/css?family=Montserrat" rel="stylesheet">
+                <link href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAoAQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAACi5jgA////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABEAAAAAAAAAERAAAAAAAAAREQAAAAAAABEBEAAAAAAAEQARAAAAAAARAAEQAAAAABEAABEAAAAAEQAAARAAAAARAAAAEQAAABEAAAABEAAAEQAAAAARAAARAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" rel="icon" type="image/x-icon"/>
+                <style>
+                  :root {
+                    font-family: 'Montserrat', sans-serif;
+                  }
+                  section {
+                    max-width: 900px;
+                    margin: 40px auto 0;
+                    border: solid 1px grey;
+                    padding: 10px;
+                  }
+                  section h2 {
+                    margin-top: -23px;
+                    background: white;
+                    float: left;
+                  }
+                  section h2 + * {
+                    clear: left;
+                  }
+                  .flex {
+                      display:flex;
+                      flex-direction:row;
+                      justify-content: space-between;
+                      flex-wrap: nowrap;
+                      align-items: center;
+                  }
+                  form label {
+                    padding-right: 5px;
+                  }
+                  form input[type='number'] {
+                    width: 50px;
+                  }
+                  .accent {
+                    color: #38e6a2;
+                    text-shadow: 0px 1px 0px #b4b4b4;
+                  }
+                  h1, h2 {
+                    text-align: center;
+                  }
+                  h1 {
+                      font-size: 50px;
+                  }
+                  .b {
+                    background-color: Transparent;
+                    border: 1px solid black;
+                    outline: none;
+                  }
+                  input {
+                    height: 30px;
+                  }
+                  article {
+                      background: #f8f8f8;
+                      margin-top: 10px;
+                      padding: 5px;
+                      text-transform: uppercase;
+                  }
+                  .access-denied, .access-granted, #template, #download-anchor {
+                    display: none;
+                  }
+                  .bold {
+                    font-weight: bold;
+                  }
+                  input[type="submit"]:hover { 
+                    cursor: pointer; 
+                  }
+                  .shortId {
+                    overflow: hidden;
+                    max-width: 9ch;
+                    white-space: nowrap;
+                    text-overflow: ellipsis;
+                  }
+                  .about {
+                    text-align: center;
+                    margin: 27px auto 0;
+                    display: block;
+                    font-size: 14px;
+                  }
+                  :focus {outline:none;}
+                  ::-moz-focus-inner {border:0;}
+                </style>
+              </head>
+              <body>
+                <h1 class="accent">VPN ON THE GO</h1>
+                <h2 class='access-denied accent'>Access Denied</h2>
+                <section id="passwordsection" style="display: block;">
+                  <h2 class="accent">PASSWORD?</h2>
+                    <form id="formpassword" class="flex">
+                    <input id="password" style="width: 80%;" type="password">
+                    <input value="SUBMIT" class="b accent" type="submit">
+                  </form>
+                </section>
+                <section class='access-granted'>
+                  <h2 class="accent">NEW</h2>
+                  <form id="form" class="flex">
+                    <div>
+                      <label for="region">REGION</label>
+                      <select id="region">
+                        <option value='us-east-1'>USA, North Virginia</option>
+                        <option value='us-west-1'>USA, North California</option>
+                        <option value='us-west-2'>USA, Oregon</option>
+                        <option selected="selected" value='eu-west-1'>Ireland</option>
+                        <option value='ap-southeast-1'>Singapore</option>
+                        <option value='ap-southeast-2 '>Australia, Sydney</option>
+                        <option value='ap-northeast-1'>Japan, Tokyo</option>
+                        <option value='sa-east-1'>São Paulo</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label for="exp-value">EXPIRATION</label>
+                      <input id="exp-value" type="number" min="1" value="6">
+                      <select id="exp-unit">
+                        <option value="1">MINUTES</option>
+                        <option value="60" selected="selected">HOURS</option>
+                        <option value="3600">DAYS</option>
+                      </select>
+                    </div>
+                    <input type="submit" value="SUBMIT" class="b accent">
+                  </form>
+                </section>
+                <section id="existing" class='access-granted'>
+                  <h2 class="accent">EXISTING</h2>
+                  <p></p>
+                   <article>
+                    <div class="flex bold">
+                      <span>REGION</span>
+                      <span>EXPIRATION</span>
+                      <span>ID</span>
+                      <input id="refresh" type="submit" value="REFRESH" class="b accent">
+                    </div>
+                  </article>
+                  <article id='template'>
+                    <div class="flex">
+                      <span>{{region}}</span>
+                      <span>{{expire}}</span>
+                      <span class='shortId'>{{id}}</span>
+                      <input type="submit" value="DELETE" class="b accent delete" data-id="{{id}}">
+                    </div>
+                    <ul class="accent">{{clients}}</ul>
+                  </article>
+                </section>
+                <a class="accent about" href="https://github.com/sd65/VPN-on-the-Go">Help & info</a>
+                <a id='download-anchor'></a>
+                <script>
+                  password = ''
+                  const showElements = (s) => Array.from(document.querySelectorAll(s)).forEach(e => e.style.display = 'block')
+                  const getSelectValue = (e) => e.options[e.selectedIndex].value
+                  const submitpassword = (e) => {
+                    e.preventDefault()
+                    password = document.getElementById("password").value
+                    document.getElementById("passwordsection").style.display = 'none'
+                    refresh()
+                  }
+                  const submit = (e) => {
+                    e.preventDefault()
+                    var expValue =  parseInt(document.getElementById("exp-value").value)
+                    var expUnit =  parseInt(getSelectValue(document.getElementById("exp-unit")))
+                    var payload = {
+                        region: getSelectValue(document.getElementById("region")),
+                        expire_in: expValue * expUnit
+                    }
+                    fetch("./api/server/",
+                    {
+                        method: "POST",
+                        body: JSON.stringify(payload),
+                        headers: {
+                          'Content-Type': 'application/json',
+                          'x-api-key': password
+                        }
+                    })
+                    .then(function(res){ return res.text() })
+                    .then(function(id){ alert("New VPN " + id + " created."); refresh() })
+                  }
+                  const refresh = () => {
+                    fetch('./api/server/', { headers: { 'x-api-key': password } })
+                    .then((res) => {
+                      if(res.ok) {
+                        return res.json()
+                      } else {
+                        throw new Error()
+                      }
+                    })
+                    .then((r) => {
+                      showElements(".access-granted")
+                      Array.from(document.querySelectorAll("#existing > *:nth-child(n+5)")).forEach(e => e.parentNode.removeChild(e))
+                      var template = '<p>No content</p>'
+                      if (Object.keys(r).length !== 0) {
+                        template = document.getElementById("template").outerHTML.replace("id=", 'data-id=')
+                        for (id in r) {
+                          for (key of [ 'region', 'expire', 'id' ]) {
+                            let replacement = (key === 'id') ? id : r[id][key]
+                            template = template.replace(new RegExp('{{' + key + '}}', 'g'), replacement)
+                          }
+                          var clients = ''
+                          if (r[id].files) {
+                            for (file of r[id].files) {
+                              clients += '<li class="download" data-href="./api/client/?object=' + id + '/' + file + '">' + file + '</li>'
+                            }
+                          } else {
+                            clients = 'In progress...'
+                          }
+                          template = template.replace('{{clients}}', clients)
+                        }
+                      }
+                      document.getElementById("existing").insertAdjacentHTML( 'beforeend', template );
+                    })
+                    .catch(() => showElements(".access-denied"))
+                  }
+                  const clickHandler = (e) => { 
+                    var initElem = e.target; 
+                    if(initElem.className === 'download') { 
+                      var anchor = document.getElementById("download-anchor")
+                      client = initElem.getAttribute("data-href")
+                      fetch(client, { headers: { 'x-api-key': password } })
+                      .then(response => response.blob())
+                      .then(blob => URL.createObjectURL(blob))
+                      .then(url => {
+                          anchor.setAttribute("href", url)
+                          anchor.setAttribute("download", client.split('=')[1].replace('/', '--'))
+                          anchor.click()
+                          URL.revokeObjectURL(url);
+                      });  
+                    } else if(initElem.className.includes('delete')) { 
+                      var id = initElem.getAttribute("data-id")
+                      fetch('./api/server/?id=' + id, { headers: { 'x-api-key': password }, method: 'DELETE' })
+                      .then((res) => {
+                        if(res.ok) {
+                          return
+                        } else {
+                          throw new Error()
+                        }
+                      })
+                      .then(() => {
+                        setTimeout(refresh, 3000)
+                      })                      
+                      .catch((e) => {
+                        alert('Error')
+                      })
+                    }
+                  }
+                  document.getElementById("form").addEventListener("submit", submit)
+                  document.getElementById("formpassword").addEventListener("submit", submitpassword)
+                  document.getElementById("refresh").addEventListener("click", refresh)
+                  document.getElementById('existing').addEventListener('click', clickHandler)
+                </script>
+              </body>
+              </html>
+
+  VpnOnTheGoApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref VpnOnTheGoApi
+      ParentId: !GetAtt VpnOnTheGoApi.RootResourceId
+      PathPart: 'api'
+
+  VpnOnTheGoVpnResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref VpnOnTheGoApi
+      ParentId: !Ref VpnOnTheGoApiResource
+      PathPart: 'server'
+
+  VpnOnTheGoApiGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RestApiId: !Ref VpnOnTheGoApi
+      ResourceId: !Ref VpnOnTheGoVpnResource
+      HttpMethod: GET
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VpnOnTheGoGetVpnLambda.Arn}/invocations"
+
+  VpnOnTheGoApiPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RestApiId: !Ref VpnOnTheGoApi
+      ResourceId: !Ref VpnOnTheGoVpnResource
+      HttpMethod: POST
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VpnOnTheGoNewVpnLambda.Arn}/invocations"
+
+  VpnOnTheGoApiDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RestApiId: !Ref VpnOnTheGoApi
+      ResourceId: !Ref VpnOnTheGoVpnResource
+      HttpMethod: DELETE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VpnOnTheGoCleanVpnLambda.Arn}/invocations"
+
+  VpnOnTheGoClientResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref VpnOnTheGoApi
+      ParentId: !Ref VpnOnTheGoApiResource
+      PathPart: 'client'
+
+  VpnOnTheGoApiGetClientMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RestApiId: !Ref VpnOnTheGoApi
+      ResourceId: !Ref VpnOnTheGoClientResource
+      HttpMethod: GET
+      RequestParameters:
+        method.request.querystring.object: true
+      MethodResponses:
+      - StatusCode: 200
+        ResponseParameters:
+            method.response.header.Content-Type: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: GET
+        Credentials: !GetAtt VpnOnTheGoDownloadRole.Arn
+        RequestParameters:
+          integration.request.path.object: method.request.querystring.object
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${VpnOnTheGoBucket}/{object}"
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Content-Type: "'binary/octet-stream'"
+
+  VpnOnTheGoApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+    - VpnOnTheGoApiGetHtmlMethod
+    - VpnOnTheGoApiGetMethod
+    - VpnOnTheGoApiPostMethod
+    Properties:
+      RestApiId: !Ref VpnOnTheGoApi
+      StageName: !Ref pStageName
+
+  VpnOnTheGoApiKeyCreatorLambdaCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+    - VpnOnTheGoApi
+    - VpnOnTheGoApiDeployment
+    Properties:
+      ServiceToken: !GetAtt VpnOnTheGoApiKeyCreatorLambda.Arn
+
+  VpnOnTheGoApiKeyCreatorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: This lambda called as a Cloudfomation Custom Resource create a Api Gateway Key with a specified password
+      Handler: index.handler
+      Role: !GetAtt VpnOnTheGoLambdasRole.Arn
+      Runtime: python3.6
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import cfnresponse
+
+          apigateway_client = boto3.client("apigateway")
+
+          def handler(event, context):
+            print(event)
+            name = 'VpnOnTheGoApiKey'
+            if event['RequestType'] == 'Delete':
+              key_id = apigateway_client.get_api_keys(
+                  nameQuery=name,
+                  includeValues=False
+              )['items'][0]['id']
+              apigateway_client.delete_api_key(apiKey=key_id)
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return 0
+            key_id = apigateway_client.create_api_key(
+              name=name,
+              enabled=True,
+              value='${pVpnPassword}',
+              stageKeys=[
+                {
+                  'restApiId': '${VpnOnTheGoApi}',
+                  'stageName': '${pStageName}'
+                },
+              ],
+            )['id']
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {'KeyId': key_id})
+
+  VpnOnTheGoOpenVpnInstallScriptLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${VpnOnTheGoApiKeyCreatorLambda}"
+      RetentionInDays: 1
+
+  VpnOnTheGoUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn:
+    - VpnOnTheGoApi
+    - VpnOnTheGoApiDeployment
+    Properties:
+      UsagePlanName: VpnOnTheGoUsagePlan
+      ApiStages:
+      - ApiId: !Ref VpnOnTheGoApi
+        Stage: !Ref pStageName
+      Quota:
+        Limit: 1000
+        Period: DAY
+      Throttle:
+        BurstLimit: 1
+        RateLimit: 1
+
+  VpnOnTheGoUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties : 
+      KeyId: !GetAtt VpnOnTheGoApiKeyCreatorLambdaCustomResource.KeyId
+      KeyType: API_KEY
+      UsagePlanId: !Ref VpnOnTheGoUsagePlan
+
+Outputs:
+  ApiUrl:
+    Description: API URL
+    Value: !Sub "https://${VpnOnTheGoApi}.execute-api.${AWS::Region}.amazonaws.com/${pStageName}/"
