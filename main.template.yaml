@@ -10,12 +10,10 @@ Parameters:
   pVpnPassword:
     Type: String
     Description: Password for auth
-    Default: vpnpasswordvpnpasswordvpnpassword
     MinLength: 20
-  pVpnOnTheGoInstallScriptName:
+  pVpnIpsecPsk:
     Type: String
-    Description: Name
-    Default: install_openvpn.sh
+    Description: IPSec PSK
 
 Resources:
 
@@ -57,7 +55,7 @@ Resources:
       Roles: 
       - !Ref VpnOnTheGoInstanceRole
 
-  VpnOnTheGoDownloadRole:
+  VpnOnTheGoApiGetClientRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -68,7 +66,7 @@ Resources:
             Service: apigateway.amazonaws.com
           Action: sts:AssumeRole
 
-  VpnOnTheGoDownloadRolePolicy:
+  VpnOnTheGoApiGetClientPolicy:
     Type: AWS::IAM::Policy
     Properties:
       PolicyName: root
@@ -80,7 +78,7 @@ Resources:
           - s3:GetObject
           Resource: arn:aws:s3:::*
       Roles: 
-      - !Ref VpnOnTheGoDownloadRole
+      - !Ref VpnOnTheGoApiGetClientRole
 
   VpnOnTheGoInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -90,141 +88,6 @@ Resources:
 
   VpnOnTheGoBucket:
     Type: AWS::S3::Bucket
-
-  VpnOnTheGoOpenVpnInstallScriptUploadCustomResource:
-    Type: AWS::CloudFormation::CustomResource
-    Properties:
-      ServiceToken: !GetAtt VpnOnTheGoOpenVpnInstallScriptLambda.Arn
-
-  VpnOnTheGoOpenVpnInstallScriptLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      Description: This lambda called as a Cloudfomation Custom Resource upload a OpenVPN install script to a bucket
-      Handler: index.handler
-      Role: !GetAtt VpnOnTheGoLambdasRole.Arn
-      Runtime: python3.6
-      Code:
-        ZipFile: !Sub |
-          import boto3
-          import cfnresponse
-
-          def handler(event, context):
-            print(event)
-            if event['RequestType'] == 'Delete':
-              boto3.client("s3").delete_object(Bucket='${VpnOnTheGoBucket}', Key='${pVpnOnTheGoInstallScriptName}')
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-              return 0
-            code = """#!/bin/bash
-
-              newclient () {
-                d="/root"
-                n="client-$(cat /proc/sys/kernel/random/uuid)"
-                cd /etc/openvpn/easy-rsa/
-                ./easyrsa build-client-full $n nopass
-                cp /etc/openvpn/client-template.txt $d/$n.ovpn
-                cat << EOF >> $d/$n.ovpn
-          <ca>
-          $(cat /etc/openvpn/easy-rsa/pki/ca.crt)
-          </ca>
-          <cert>
-          $(cat /etc/openvpn/easy-rsa/pki/issued/$n.crt)
-          </cert>
-          <key>
-          $(cat /etc/openvpn/easy-rsa/pki/private/$n.key)
-          </key>
-          key-direction 1
-          <tls-auth>
-          $(cat /etc/openvpn/tls-auth.key)
-          </tls-auth>
-          EOF
-              }
-
-              [[ "$1" == newclient ]] && newclient && exit
-
-              PORT=1194
-              CIPHER="cipher AES-128-CBC"
-              DH_KEY_SIZE="2048"
-              RSA_KEY_SIZE="2048"
-
-              yum install -y epel-release
-              yum install -y openvpn iptables openssl wget ca-certificates curl
-              wget -O ~/EasyRSA-3.0.3.tgz https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.3/EasyRSA-3.0.3.tgz
-              tar xzf ~/EasyRSA-3.0.3.tgz -C ~/
-              mv ~/EasyRSA-3.0.3/ /etc/openvpn/easy-rsa/
-              chown -R root:root /etc/openvpn/easy-rsa/
-              rm -rf ~/EasyRSA-3.0.3.tgz
-              cd /etc/openvpn/easy-rsa/
-              echo "set_var EASYRSA_KEY_SIZE $RSA_KEY_SIZE" > vars
-              rngd -r /dev/urandom -o /dev/random
-              ./easyrsa init-pki
-              ./easyrsa --batch build-ca nopass
-              openssl dhparam -out dh.pem $DH_KEY_SIZE
-              ./easyrsa build-server-full server nopass
-              EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl
-              openvpn --genkey --secret /etc/openvpn/tls-auth.key
-              cp pki/ca.crt pki/private/ca.key dh.pem pki/issued/server.crt pki/private/server.key /etc/openvpn/easy-rsa/pki/crl.pem /etc/openvpn
-              chmod 644 /etc/openvpn/crl.pem
-              echo "local $(curl http://169.254.169.254/latest/meta-data/local-ipv4)
-              port $PORT
-              proto udp
-              dev tun
-              user nobody
-              group nobody
-              persist-key
-              persist-tun
-              keepalive 10 120
-              topology subnet
-              server 10.8.0.0 255.255.255.0
-              ifconfig-pool-persist ipp.txt
-              push 'dhcp-option DNS 208.67.222.222'
-              push 'dhcp-option DNS 208.67.220.220'
-              push 'redirect-gateway def1 bypass-dhcp'
-              crl-verify crl.pem
-              ca ca.crt
-              cert server.crt
-              key server.key
-              tls-auth tls-auth.key 0
-              dh dh.pem
-              auth SHA256
-              $CIPHER
-              tls-server
-              tls-version-min 1.2
-              tls-cipher TLS-DHE-RSA-WITH-AES-128-GCM-SHA256
-              status openvpn.log
-              verb 3" > /etc/openvpn/server.conf
-              echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-              echo 1 > /proc/sys/net/ipv4/ip_forward
-              $(echo "iptables -t nat -A POSTROUTING -o eth0 -s 10.8.0.0/24 -j MASQUERADE" | tee /etc/rc.d/rc.local)
-              chmod +x /etc/rc.d/rc.local
-              service openvpn restart
-              chkconfig openvpn on
-              IP=$(curl http://169.254.169.254/latest/meta-data/public-ipv4)
-              echo "client
-              proto udp
-              remote $IP $PORT
-              dev tun
-              resolv-retry infinite
-              nobind
-              persist-key
-              persist-tun
-              remote-cert-tls server
-              auth SHA256
-              $CIPHER
-              tls-client
-              tls-version-min 1.2
-              tls-cipher TLS-DHE-RSA-WITH-AES-128-GCM-SHA256
-              setenv opt block-outside-dns
-              verb 3" > /etc/openvpn/client-template.txt
-              newclient
-            """
-            boto3.client("s3").put_object(Bucket='${VpnOnTheGoBucket}', Key='${pVpnOnTheGoInstallScriptName}', Body=code)
-            cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-
-  VpnOnTheGoOpenVpnInstallScriptLambdaLogGroup:
-   Type: AWS::Logs::LogGroup
-   Properties:
-      LogGroupName: !Sub "/aws/lambda/${VpnOnTheGoOpenVpnInstallScriptLambda}"
-      RetentionInDays: 1
 
   VpnOnTheGoLambdasRole:
     Type: AWS::IAM::Role
@@ -268,7 +131,6 @@ Resources:
         ZipFile: !Sub |
           import json
           import boto3
-          import base64
           import uuid
           import time
 
@@ -276,62 +138,74 @@ Resources:
 
           def handler(event, context):
             # Checks
-            if not event['body']:
-              return die('No body')
             try:
               body = json.loads(event['body'])
             except Exception:
-              return die('Not a json body')
-            if not 'region' in body:
-              return die('No region in body')
-            region = body['region']
-            if not 'expire_in' in body:
-              expire_in = 0
-            else:
-              expire_in = body['expire_in']
+              return die('No JSON body')
+            try:
+              region = body['region']
+              expire_in = int(body['expire_in'])
+            except Exception:
+              return die('No region or expire_in in body')
             # Do
+            s = boto3.Session(region_name=region)
             expire_tt = 0 if expire_in == 0 else int(time.time()) + ( expire_in * 60)
             id = "{}_{}_{}".format(uuid.uuid4(), region, expire_tt)
             bucket = '${VpnOnTheGoBucket}'
-            boto3.client("s3").put_object(Bucket=bucket, Key=id + '/in_progress')
-            boto3.client("s3").put_object(Bucket=bucket, Key=id + '/first_run_cleaner_ignore')
+            for name in [ 'in_progress', 'first_run_cleaner_ignore' ]:
+              s.client("s3").put_object(Bucket=bucket, Key=id + '/' + name)
             # SG
-            client = boto3.client('ec2', region_name=region)
-            sg_group_id = client.create_security_group(Description='VPNONTHEGO', GroupName=id)['GroupId']
-            client.authorize_security_group_ingress(GroupId=sg_group_id, IpProtocol='udp', FromPort=1194, ToPort=1194, CidrIp='0.0.0.0/0')
+            ec2_client = s.client('ec2', region_name=region)
+            sg_group_id = ec2_client.create_security_group(Description='VPNONTHEGO', GroupName=id)['GroupId']
+            ports = [ 'udp500', 'udp4500', 'tcp1701', 'udp1194', 'tcp443', 'tcp5555' ]
+            for p in ports:
+              ec2_client.authorize_security_group_ingress(GroupId=sg_group_id, IpProtocol=p[:3], FromPort=int(p[3:]), ToPort=int(p[3:]), CidrIp='0.0.0.0/0')
             # Find latest image
-            response = client.describe_images(
+            response = ec2_client.describe_images(
                 Filters=[
-                    { 'Name': 'owner-alias', 'Values': [ 'amazon' ] },                 
-                    { 'Name': 'virtualization-type', 'Values': [ 'paravirtual' ] },                      
-                    { 'Name': 'description', 'Values': [ 'Amazon Linux AMI * x86_64 PV EBS' ] }
+                    { 'Name': 'owner-alias', 'Values': [ 'amazon' ] },
+                    { 'Name': 'virtualization-type', 'Values': [ 'hvm' ] },
+                    { 'Name': 'description', 'Values': [ 'Amazon Linux AMI * x86_64 HVM GP2' ] }
                 ]
             )
             latest_image = sorted(response['Images'], key=lambda k: k['CreationDate'], reverse=True)[0]['ImageId']
             # Request Spot instances
-            request = client.request_spot_instances(
-              SpotPrice='0.02',
-              LaunchSpecification={
-                  'SecurityGroups': [ id ],
-                  'IamInstanceProfile': { 'Arn': '${VpnOnTheGoInstanceProfile.Arn}' },
-                  'ImageId': latest_image,
-                  'InstanceType': 't1.micro',
-                  'UserData': base64.b64encode("""#!/bin/bash 
-                    set -ex
-                    yum update -y
-                    aws s3 cp s3://{bucket}/${pVpnOnTheGoInstallScriptName} .
-                    bash ${pVpnOnTheGoInstallScriptName}
-                    aws s3 cp /root/client* s3://{bucket}/{id}/
-                    rm /root/client*
-                    aws s3 rm s3://{bucket}/{id}/in_progress
-                  """.format(bucket=bucket, id=id).encode('utf-8')).decode('utf-8')
-              },
-            )['SpotInstanceRequests'][0]['SpotInstanceRequestId']
-            client.create_tags(Resources=[ request ], Tags=[ { 'Key': 'id', 'Value': id } ])
-            #client.get_waiter('spot_instance_request_fulfilled').wait(
-            #  SpotInstanceRequestIds=[ request ],
-            #  WaiterConfig={ 'Delay': 5, 'MaxAttempts': 10 }
-            #)
+            ports_to_expose = ''.join([' -p {n}:{n}/{p}'.format(p=p[:3], n=p[3:]) for p in ports])
+            ec2_resource = boto3.resource('ec2')
+            instance = ec2_resource.create_instances(
+              MinCount=1,
+              MaxCount=1,
+              SecurityGroups=[ id ],
+              UserData="""#!/bin/bash -e
+                yum update -y
+                yum install -y docker
+                PASS=$(shuf -n 3 /usr/share/dict/words | sed ':a;N;$!ba;s/\\n/-/g')
+                export USERS=''
+                for n in $(seq 0 9); do
+                  USERS+="vpnonthego$n:$PASS;"
+                done
+                service docker start
+                docker run -d -e PSK=${pVpnIpsecPsk} -e USERS --cap-add NET_ADMIN {ports_to_expose} siomiz/softethervpn > container
+                while
+                  docker logs $(<container) > config.ovpn
+                  ! grep -q 'initial setup OK' < config.ovpn
+                do
+                  sleep 1
+                done
+                echo "$(curl http://169.254.169.254/latest/meta-data/public-ipv4);$PASS" > metadata
+                aws s3 mv ./config.ovpn s3://{bucket}/{id}/
+                aws s3 mv ./metadata s3://{bucket}/{id}/
+                aws s3 rm s3://{bucket}/{id}/in_progress
+              """.format(bucket=bucket, id=id, ports_to_expose=ports_to_expose),
+              IamInstanceProfile={ 'Arn': '${VpnOnTheGoInstanceProfile.Arn}' },
+              InstanceMarketOptions={'MarketType': 'spot'},
+              InstanceType="t2.micro", 
+              ImageId=latest_image,
+              TagSpecifications=[ 
+                { 'ResourceType': 'instance', 'Tags': [ { 'Key': 'id', 'Value': id } ] },
+                #{ 'ResourceType': 'spot-instances-request', 'Tags': [ { 'Key': 'id', 'Value': id } ] } 
+              ],
+            )
             # Plan deletion
             if expire_in > 0:
               cloudwatch_events = boto3.client('events')
@@ -345,10 +219,7 @@ Resources:
                   Rule=id,
                   Targets=[ {  'Arn': '${VpnOnTheGoCleanVpnLambda.Arn}', 'Id': id, 'Input': json.dumps({'id': id}) } ]
               )
-            return {
-              'statusCode': 200,
-              'body': id
-            }
+            return { 'statusCode': 200, 'body': id }
 
   VpnOnTheGoNewVpnLambdaPermission:
     Type: AWS::Lambda::Permission
@@ -385,8 +256,6 @@ Resources:
             res = {}
             if 'Contents' in bucket:
               for f in bucket['Contents']:
-                if f['Key'] == '${pVpnOnTheGoInstallScriptName}':
-                  continue
                 key, file = f['Key'].split('/')
                 if not key in res or not isinstance(res[key], dict):
                   _, region, expire_tt = key.split('_')
@@ -399,12 +268,11 @@ Resources:
                   res[key] = { 'region': region, 'expire_tt': expire_tt, 'expire': expire}
                 if file == 'in_progress':
                   res[key]['in_progress'] = True
-                elif file == 'first_run_cleaner_ignore':
+                elif file == 'metadata':
+                  metadata = client_s3.get_object(Bucket='${VpnOnTheGoBucket}', Key=f['Key'])['Body'].read().decode("utf-8") 
+                  res[key]['ip'], res[key]['pass'] = metadata.split(';')
+                elif file == 'first_run_cleaner_ignore' or file == 'config.ovpn':
                   continue
-                else:
-                  if not 'files' in res[key]:
-                    res[key]['files'] = []
-                  res[key]['files'].append(file)
             return { 'statusCode': 200, 'body': json.dumps(res) }
 
   VpnOnTheGoGetVpnLambdaPermission:
@@ -459,9 +327,9 @@ Resources:
             for file in bucket['Contents']:
               client_s3.delete_object(Bucket='${VpnOnTheGoBucket}', Key=file['Key'])
             client_ec2 = boto3.client('ec2', region_name=region)
-            r = client_ec2.describe_spot_instance_requests(Filters=[ { 'Name': 'tag:id', 'Values': [ id ] }])['SpotInstanceRequests'][0]
-            sir_id = r['SpotInstanceRequestId']
+            r = client_ec2.describe_instances(Filters=[ { 'Name': 'tag:id', 'Values': [ id ] }])['Reservations'][0]['Instances'][0]
             instance_id = r['InstanceId']
+            sir_id = r['SpotInstanceRequestId']
             client_ec2.terminate_instances(InstanceIds=[ instance_id ])
             client_ec2.cancel_spot_instance_requests(SpotInstanceRequestIds=[ sir_id ])
             #client_ec2.delete_security_group(GroupName=id)
@@ -576,7 +444,7 @@ Resources:
                       padding: 5px;
                       text-transform: uppercase;
                   }
-                  .access-denied, .access-granted, #template, #download-anchor, #toast {
+                  .access-denied, .access-granted, #template, #download-anchor, #toast, .hidden {
                     display: none;
                   }
                   .bold {
@@ -607,6 +475,9 @@ Resources:
                       color: white;
                       padding: 10px;
                       font-size: 20px;
+                  }
+                  .nott {
+                    text-transform: none;
                   }
                   :focus {outline:none;}
                   ::-moz-focus-inner {border:0;}
@@ -668,7 +539,12 @@ Resources:
                       <span class='shortId'>{{id}}</span>
                       <input type="submit" value="DELETE" class="b accent delete" data-id="{{id}}">
                     </div>
-                    <ul class="accent">{{clients}}</ul>
+                    <p class="{{class_in_progress}}">IN PROGRESS...</p>
+                    <ul class="{{class_metadata}}">
+                      <li><span class="accent">IP:</span> <span class="nott">{{ip}}</span></li>
+                      <li><span class="accent">PASSWORD:</span> <span class="nott">{{pass}}</span></li>
+                      <li class="download" data-href="./api/client/?id={{id}}"><span class="accent">Download OpenVPN config file</span></li>
+                    </ul>
                   </article>
                 </section>
                 <a class="accent about" href="https://github.com/sd65/VPN-on-the-Go">Help & info</a>
@@ -742,15 +618,15 @@ Resources:
                             let replacement = (key === 'id') ? id : r[id][key]
                             template = template.replace(new RegExp('{{' + key + '}}', 'g'), replacement)
                           }
-                          var clients = ''
-                          if (r[id].files) {
-                            for (file of r[id].files) {
-                              clients += '<li class="download" data-href="./api/client/?object=' + id + '/' + file + '">' + file + '</li>'
-                            }
+                          if (r[id].ip && r[id].pass) {
+                            template = template.replace(new RegExp('{{class_metadata}}', 'g'), '')
+                            template = template.replace(new RegExp('{{class_in_progress}}', 'g'), 'hidden')
+                            template = template.replace(new RegExp('{{ip}}', 'g'), r[id].ip)
+                            template = template.replace(new RegExp('{{pass}}', 'g'), r[id].pass)
                           } else {
-                            clients = 'In progress...'
+                            template = template.replace(new RegExp('{{class_metadata}}', 'g'), 'hidden')
+                            template = template.replace(new RegExp('{{class_in_progress}}', 'g'), '')
                           }
-                          template = template.replace('{{clients}}', clients)
                         }
                       }
                       document.getElementById("existing").insertAdjacentHTML( 'beforeend', template );
@@ -876,7 +752,7 @@ Resources:
       ResourceId: !Ref VpnOnTheGoClientResource
       HttpMethod: GET
       RequestParameters:
-        method.request.querystring.object: true
+        method.request.querystring.id: true
       MethodResponses:
       - StatusCode: 200
         ResponseParameters:
@@ -884,10 +760,10 @@ Resources:
       Integration:
         Type: AWS
         IntegrationHttpMethod: GET
-        Credentials: !GetAtt VpnOnTheGoDownloadRole.Arn
+        Credentials: !GetAtt VpnOnTheGoApiGetClientRole.Arn
         RequestParameters:
-          integration.request.path.object: method.request.querystring.object
-        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${VpnOnTheGoBucket}/{object}"
+          integration.request.path.id: method.request.querystring.id
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/${VpnOnTheGoBucket}/{id}/config.ovpn"
         IntegrationResponses:
         - StatusCode: 200
           ResponseParameters:
