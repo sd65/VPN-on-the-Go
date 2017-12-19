@@ -40,6 +40,6 @@ When a new VPN is up, you can use it with multiple VPN protocols:
 
 ## Costs
 
-No much.
+Not much.
 
 ## FAQ
