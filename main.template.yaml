@@ -171,11 +171,11 @@ Resources:
             latest_image = sorted(response['Images'], key=lambda k: k['CreationDate'], reverse=True)[0]['ImageId']
             # Request Spot instances
             ports_to_expose = ''.join([' -p {n}:{n}/{p}'.format(p=p[:3], n=p[3:]) for p in ports])
-            ec2_resource = boto3.resource('ec2')
+            ec2_resource = s.resource('ec2')
             instance = ec2_resource.create_instances(
               MinCount=1,
               MaxCount=1,
-              SecurityGroups=[ id ],
+              SecurityGroupIds=[ sg_group_id ],
               UserData="""#!/bin/bash -e
                 yum update -y
                 yum install -y docker
