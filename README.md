@@ -2,6 +2,8 @@
 
 VPN as a service on AWS.
 
+![A screenshot](https://raw.githubusercontent.com/sd65/VPN-on-the-Go/master/screenshot.png)
+
 ## How to deploy
 
 Click here :
